@@ -18,10 +18,13 @@ from git import Repo
 from git import NULL_TREE
 from truffleHogRegexes.regexChecks import regexes
 
+f = open('out.csv','w')
+
 
 def main():
     parser = argparse.ArgumentParser(description='Find secrets hidden in the depths of git.')
     parser.add_argument('--json', dest="output_json", action="store_true", help="Output in JSON")
+    parser.add_argument('--zf', dest="output_zf", action="store_true", help="Output for ZeroFOX")
     parser.add_argument("--regex", dest="do_regex", action="store_true", help="Enable high signal regex checks")
     parser.add_argument("--rules", dest="rules", help="Ignore default regexes and source from json list file")
     parser.add_argument("--entropy", dest="do_entropy", help="Enable entropy checks")
@@ -48,7 +51,7 @@ def main():
         for regex in rules:
             regexes[regex] = rules[regex]
     do_entropy = str2bool(args.do_entropy)
-    output = find_strings(args.git_url, args.since_commit, args.max_depth, args.output_json, args.do_regex, do_entropy, surpress_output=False)
+    output = find_strings(args.git_url, args.since_commit, args.max_depth, args.output_json, args.output_zf, args.do_regex, do_entropy, surpress_output=False)
     project_path = output["project_path"]
     shutil.rmtree(project_path, onerror=del_rw)
     if output["foundIssues"]:
@@ -120,18 +123,32 @@ def clone_git_repo(git_url):
     Repo.clone_from(git_url, project_path)
     return project_path
 
-def print_results(printJson, issue, git_url):
+def print_results(printJson, printZF, issue, git_url):
     commit_time = issue['date']
     branch_name = issue['branch']
     prev_commit = issue['commit']
     printableDiff = issue['printDiff']
-    print issue
     commitHash = issue['commitHash']
     reason = issue['reason']
     path = issue['path']
+    lines = issue['lines']
+    bad_line = issue['bad_lines']
 
     if printJson:
         print(json.dumps(issue, sort_keys=True))
+    elif printZF:
+        overlap = path[:path.find('/')]
+        commit = "/blob/" + commitHash
+
+        for issue_number in range(0,len(lines)):
+            if "," in bad_line[issue_number]:
+                print bad_line[issue_number]
+            print
+            output = ""
+            output += git_url + ", "
+            output += (git_url + commit + "/" + path + "#L" + str(lines[issue_number])) + ", "
+            output += bad_line[issue_number] + "\n"
+            f.write(output)
     else:
         print("~~~~~~~~~~~~~~~~~~~~~")
         reason = "{}Reason: {}{}".format(bcolors.OKGREEN, reason, bcolors.ENDC)
@@ -154,14 +171,21 @@ def print_results(printJson, issue, git_url):
             print(branchStr)
             commitStr = "{}Commit: {}{}".format(bcolors.OKGREEN, prev_commit.encode('utf-8'), bcolors.ENDC)
             print(commitStr)
-            print(git_url + "/" + path)
-            #print(printableDiff.encode('utf-8'))
+            print(printableDiff.encode('utf-8'))
         print("~~~~~~~~~~~~~~~~~~~~~")
 
-def find_entropy(printableDiff, commit_time, branch_name, prev_commit, blob, commitHash):
+def find_entropy(printableDiff, line_start, commit_time, branch_name, prev_commit, blob, commitHash):
     stringsFound = []
+    bad_lines = []
+    found_lines = []
+    found_line = None
     lines = printableDiff.split("\n")
+    counter = 0
     for line in lines:
+        if counter == 0:
+            firstline = line
+        if len(line) > 0 and line[0] == '-':
+            continue
         for word in line.split():
             base64_strings = get_strings_of_set(word, BASE64_CHARS)
             hex_strings = get_strings_of_set(word, HEX_CHARS)
@@ -170,11 +194,29 @@ def find_entropy(printableDiff, commit_time, branch_name, prev_commit, blob, com
                 if b64Entropy > 4.5:
                     stringsFound.append(string)
                     printableDiff = printableDiff.replace(string, bcolors.WARNING + string + bcolors.ENDC)
+                    # first line is a header and it starts at 0
+                    found_lines.append((counter - 1) + line_start)
+                    line = re.sub("\@\@ [\-|\+]\d+(?:,\d+)?\s[\-|\+](\d+)(?:,\d+)?\s\@\@ ", "+", line)
+                    bad_lines.append(line)
+
+                    #print firstline
+                    #print line
+                    #print (counter - 1) + line_start
             for string in hex_strings:
                 hexEntropy = shannon_entropy(string, HEX_CHARS)
                 if hexEntropy > 3:
                     stringsFound.append(string)
                     printableDiff = printableDiff.replace(string, bcolors.WARNING + string + bcolors.ENDC)
+                    found_line = counter
+                    # first line is a header and it starts at 0
+                    found_lines.append((counter - 1) + line_start)
+                    line = re.sub("\@\@ [\-|\+]\d+(?:,\d+)?\s[\-|\+](\d+)(?:,\d+)?\s\@\@ ", "+", line)
+                    bad_lines.append(line)
+                    #print firstline
+                    #print line
+                    #print (counter - 2) + line_start
+        counter += 1
+
     entropicDiff = None
     if len(stringsFound) > 0:
         entropicDiff = {}
@@ -185,8 +227,10 @@ def find_entropy(printableDiff, commit_time, branch_name, prev_commit, blob, com
         entropicDiff['diff'] = blob.diff.decode('utf-8', errors='replace')
         entropicDiff['stringsFound'] = stringsFound
         entropicDiff['printDiff'] = printableDiff
+        entropicDiff['lines'] = found_lines
         entropicDiff['commitHash'] = commitHash
         entropicDiff['reason'] = "High Entropy"
+        entropicDiff['bad_lines'] = bad_lines
     return entropicDiff
 
 def regex_check(printableDiff, commit_time, branch_name, prev_commit, blob, commitHash, custom_regexes={}):
@@ -213,16 +257,23 @@ def regex_check(printableDiff, commit_time, branch_name, prev_commit, blob, comm
             regex_matches.append(foundRegex)
     return regex_matches
 
-def diff_worker(diff, curr_commit, prev_commit, branch_name, commitHash, custom_regexes, do_entropy, do_regex, printJson, surpress_output, git_url):
+def diff_worker(diff, curr_commit, prev_commit, branch_name, commitHash, custom_regexes, do_entropy, do_regex, printJson, printZF, surpress_output, git_url):
     issues = []
     for blob in diff:
         printableDiff = blob.diff.decode('utf-8', errors='replace')
-        if printableDiff.startswith("Binary files"):
+        if printableDiff.startswith("Binary files") or printableDiff == "":
             continue
+        line_start = re.findall('\@\@ [\-|\+]\d+(?:,\d+)?\s[\-|\+](\d+)(?:,\d+)?\s\@\@',blob.diff.split('\n')[0])
+        if not line_start:
+                print "[-] Couldn't find chunk header index"
+                continue
+        line_start = int(line_start[0])
+
         commit_time =  datetime.datetime.fromtimestamp(prev_commit.committed_date).strftime('%Y-%m-%d %H:%M:%S')
         foundIssues = []
+
         if do_entropy:
-            entropicDiff = find_entropy(printableDiff, commit_time, branch_name, prev_commit, blob, commitHash)
+            entropicDiff = find_entropy(printableDiff, line_start, commit_time, branch_name, prev_commit, blob, commitHash)
             if entropicDiff:
                 foundIssues.append(entropicDiff)
         if do_regex:
@@ -230,7 +281,7 @@ def diff_worker(diff, curr_commit, prev_commit, branch_name, commitHash, custom_
             foundIssues += found_regexes
         if not surpress_output:
             for foundIssue in foundIssues:
-                print_results(printJson, foundIssue, git_url)
+                print_results(printJson, printZF, foundIssue, git_url)
         issues += foundIssues
     return issues
 
@@ -242,7 +293,7 @@ def handle_results(output, output_dir, foundIssues):
         output["foundIssues"].append(result_path)
     return output
 
-def find_strings(git_url, since_commit=None, max_depth=1000000, printJson=False, do_regex=False, do_entropy=True, surpress_output=True, custom_regexes={}):
+def find_strings(git_url, since_commit=None, max_depth=1000000, printJson=False, printZF=False, do_regex=False, do_entropy=True, surpress_output=True, custom_regexes={}):
     output = {"foundIssues": []}
     project_path = clone_git_repo(git_url)
     repo = Repo(project_path)
@@ -274,12 +325,12 @@ def find_strings(git_url, since_commit=None, max_depth=1000000, printJson=False,
                 diff = prev_commit.diff(curr_commit, create_patch=True)
             # avoid searching the same diffs
             already_searched.add(diff_hash)
-            foundIssues = diff_worker(diff, curr_commit, prev_commit, branch_name, commitHash, custom_regexes, do_entropy, do_regex, printJson, surpress_output, git_url)
+            foundIssues = diff_worker(diff, curr_commit, prev_commit, branch_name, commitHash, custom_regexes, do_entropy, do_regex, printJson, printZF, surpress_output, git_url)
             output = handle_results(output, output_dir, foundIssues)
             prev_commit = curr_commit
         # Handling the first commit
         diff = curr_commit.diff(NULL_TREE, create_patch=True)
-        foundIssues = diff_worker(diff, curr_commit, prev_commit, branch_name, commitHash, custom_regexes, do_entropy, do_regex, printJson, surpress_output, git_url)
+        foundIssues = diff_worker(diff, curr_commit, prev_commit, branch_name, commitHash, custom_regexes, do_entropy, do_regex, printJson, printZF, surpress_output, git_url)
         output = handle_results(output, output_dir, foundIssues)
     output["project_path"] = project_path
     output["clone_uri"] = git_url
